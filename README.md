@@ -1,10 +1,14 @@
 ![Extension Icon](./assets/icon128.png)
 
+<div style="text-align:center;">
+
 # Google Calendar Quick Duplicate
 
-> A simple Chrome Extension to duplicate Google Calendar events in one click.
+**A simple Chrome extension that duplicates Google Calendar events with one click.**
 
 [![Get it on Chrome Web Store](https://developer.chrome.com/static/docs/webstore/branding/image/206x58-chrome-web-bcb82d15b2486.png)](https://chromewebstore.google.com/detail/belnijodgolpgmpahmdkjbjehbobnfpd?utm_source=item-share-cb)
+
+</div>
 
 ---
 
