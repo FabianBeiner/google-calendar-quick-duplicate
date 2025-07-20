@@ -1,22 +1,30 @@
 'use strict';
 
 /**
- * Dynamic style-adaptive duplicate button.
- * Adapts to both panel variants (with or without background image / circle spacer).
- * Includes previous stabilization (debounced injection + heal observer).
+ * Duplicate Button Extension – dynamic style adaptive + View Context restore (variant c).
+ * - Speichert View-Kontext (Mode, Datum, EventID, Scroll)
+ * - Navigiert nach Duplizieren zurück in identische Ansicht
+ * - Öffnet ursprüngliches Eventpanel erneut (REOPEN_EVENT_PANEL = true)
  */
 
-const DEBUG = true;
+const DEBUG = false;
+const REOPEN_EVENT_PANEL = true;              // Panel nach Rückkehr wieder öffnen
+const VIEW_RESTORE_TIMEOUT = 6000;            // Max Zeit (ms) um View + Event wiederherzustellen
+const EVENT_REOPEN_RETRY_INTERVAL = 120;      // Poll-Intervall beim Suchen des Eventchips
+const GRID_READY_SELECTOR_CANDIDATES = [
+  '[role="grid"]',
+  '.YQXjgd',          // mögliche Kalender-Hauptgrid Klasse
+  '.W0m3G',            // alternative Grid-Klasse
+];
 
 function log(...args) {
   if (DEBUG) {
     console.debug('[GCQD]', ...args);
   } else {
-    console.info('[GCQD]', ...args);
+    console.log('[GCQD]', ...args);
   }
 }
 
-/* ================== CONSTANTS ================== */
 const GCQD_DUPLICATE_BUTTON_CLASS = 'dup-btn';
 const GCQD_DUPLICATE_BUTTON_SELECTOR = `.${ GCQD_DUPLICATE_BUTTON_CLASS }`;
 const CALENDAR_EVENT_SELECTOR = 'div[data-eventid][data-eventchip], div[data-event-id][data-eventchip]';
@@ -67,6 +75,7 @@ class DuplicatorState {
     this.originalUrl = '';
     this.currentDate = '';
     this.isDuplicating = false;
+    this.viewContext = null;
   }
 
   setInterval(name, fn, d) {
@@ -104,12 +113,17 @@ class DuplicatorState {
     this.originalUrl = location.href;
   }
 
-  reset() {
+  resetRuntime() {
     this.clearAllIntervals();
     this.retryCount.clear();
+    this.isDuplicating = false;
+  }
+
+  fullReset() {
+    this.resetRuntime();
     this.originalUrl = '';
     this.currentDate = '';
-    this.isDuplicating = false;
+    this.viewContext = null;
   }
 }
 
@@ -173,16 +187,235 @@ function setUpShortcut(e) {
   }
 }
 
-/* ================== DYNAMIC BUTTON TEMPLATE ================== */
+/* ================== VIEW CONTEXT CAPTURE / RESTORE ================== */
 
-// PATCH: Build button based on reference button in panel
+/**
+ * Versucht Modus (view mode) und Datum aus der aktuellen URL zu extrahieren.
+ * Google Calendar URLs Varianten:
+ *  - https://calendar.google.com/calendar/u/0/r/week/2025/2/18
+ *  - https://calendar.google.com/calendar/u/0/r/day
+ *  - Parameter wie ?mode=day&date=20250218 möglich (Fallback)
+ */
+function parseModeAndDateFromUrl(url) {
+  const res = { mode: null, dateToken: null };
+  try {
+    const u = new URL(url);
+    // Query First
+    if (u.searchParams.has('mode')) {
+      res.mode = u.searchParams.get('mode');
+    }
+    if (u.searchParams.has('date')) {
+      res.dateToken = u.searchParams.get('date');
+    }
+    // Path tokens
+    const parts = u.pathname.split('/').filter(Boolean); // e.g. ["calendar","u","0","r","week","2025","2","18"]
+    const rIndex = parts.indexOf('r');
+    if (rIndex !== -1) {
+      const after = parts.slice(rIndex + 1);
+      if (after.length) {
+        if (!res.mode && /^[a-z]+$/i.test(after[0])) {
+          res.mode = after[0];
+        }
+        // Date segments follow mode
+        const dateParts = after.slice(1).
+                                map(x => parseInt(x, 10)).
+                                filter(n => !isNaN(n));
+        if (dateParts.length >= 3) {
+          const [y, m, d] = dateParts;
+          // Normalize to YYYYMMDD
+          res.dateToken = `${ y.toString().padStart(4, '0') }${ m.toString().
+                                                                  padStart(2,
+                                                                           '0') }${ d.toString().
+                                                                                      padStart(
+                                                                                          2,
+                                                                                          '0') }`;
+        }
+      }
+    }
+  } catch (e) {
+    log('parseModeAndDate error', e);
+  }
+  return res;
+}
+
+function captureScrollContext() {
+  // Versuche typische Scrollcontainer zu finden
+  const candidates = [
+    '.W0m3G',        // grid wrapper variant
+    '.YQXjgd',       // alternative
+    '.tEhMVd',       // mobile / alt
+  ];
+  for (const sel of candidates) {
+    const el = document.querySelector(sel);
+    if (el) {
+      return {
+        selector: sel,
+        scrollTop: el.scrollTop,
+        scrollLeft: el.scrollLeft,
+      };
+    }
+  }
+  return null;
+}
+
+function restoreScrollContext(scrollCtx) {
+  if (!scrollCtx) {
+    return;
+  }
+  const el = document.querySelector(scrollCtx.selector);
+  if (!el) {
+    return;
+  }
+  try {
+    el.scrollTop = scrollCtx.scrollTop;
+    el.scrollLeft = scrollCtx.scrollLeft;
+  } catch (_) { /* ignore */
+  }
+}
+
+/**
+ * Sichert alle relevanten Infos vor Start der Duplizierung.
+ * eventId: optional bereits extrahiert
+ */
+function captureViewContext(originalEventId) {
+  const { mode, dateToken } = parseModeAndDateFromUrl(location.href);
+  const scrollCtx = captureScrollContext();
+  state.viewContext = {
+    mode: mode || null,
+    dateToken: dateToken || null,
+    originalEventId: originalEventId || null,
+    originalUrl: location.href,
+    scrollCtx,
+  };
+  log('Captured view context', state.viewContext);
+}
+
+/**
+ * Baut eine Ziel-URL. Falls Mode / dateToken fehlen, nimm originalUrl.
+ */
+function buildViewUrl(context) {
+  if (!context) {
+    return state.originalUrl || location.origin;
+  }
+  // Wenn originalUrl noch gültig (z.B. /r/week/...), nimm die – solange sie kein duplicate/eventedit enthält.
+  if (context.originalUrl && !/duplicate|eventedit/.test(context.originalUrl)) {
+    return context.originalUrl;
+  }
+  // Fallback generisch: https://calendar.google.com/calendar/u/0/r/{mode}/{YYYY}/{M}/{D}
+  const base = location.origin;
+  const userSeg = '/calendar/u/0/r';
+  if (context.mode && context.dateToken && context.dateToken.length === 8) {
+    const y = context.dateToken.slice(0, 4);
+    const m = parseInt(context.dateToken.slice(4, 6), 10); // no leading zeros in path
+    const d = parseInt(context.dateToken.slice(6, 8), 10);
+    return `${ base }${ userSeg }/${ context.mode }/${ y }/${ m }/${ d }`;
+  }
+  if (context.mode) {
+    return `${ base }${ userSeg }/${ context.mode }`;
+  }
+  return `${ base }${ userSeg }`;
+}
+
+/**
+ * Wartet bis mindestens eines der Grid-Selektoren vorhanden ist.
+ */
+function waitForGridReady(timeoutMs) {
+  return new Promise(resolve => {
+    const start = Date.now();
+
+    function check() {
+      if (GRID_READY_SELECTOR_CANDIDATES.some(
+          sel => document.querySelector(sel))) {
+        return resolve(true);
+      }
+      if (Date.now() - start > timeoutMs) {
+        return resolve(false);
+      }
+      requestAnimationFrame(check);
+    }
+
+    check();
+  });
+}
+
+/**
+ * Sucht und klickt das ursprüngliche Event.
+ */
+function reopenOriginalEvent(context) {
+  return new Promise(resolve => {
+    if (!context || !context.originalEventId) {
+      return resolve(false);
+    }
+
+    const start = Date.now();
+    const tryFind = () => {
+      const chip = document.querySelector(`div[data-eventid="${ CSS.escape(
+          context.originalEventId) }"][data-eventchip], div[data-event-id="${ CSS.escape(
+          context.originalEventId) }"][data-eventchip]`);
+      if (chip) {
+        simulateClick(chip);
+        log('Reopened original event panel');
+        return resolve(true);
+      }
+      if (Date.now() - start > VIEW_RESTORE_TIMEOUT) {
+        return resolve(false);
+      }
+      setTimeout(tryFind, EVENT_REOPEN_RETRY_INTERVAL);
+    };
+    tryFind();
+  });
+}
+
+/**
+ * Führt die komplette Wiederherstellung durch:
+ *  - Navigate zu rekonstruierter URL (falls nötig)
+ *  - Warte Grid
+ *  - Scroll wiederherstellen
+ *  - Panel erneut öffnen (optional)
+ */
+async function restoreViewContext() {
+  const ctx = state.viewContext;
+  if (!ctx) {
+    return;
+  }
+
+  const targetUrl = buildViewUrl(ctx);
+  const needNavigate = location.href !== targetUrl;
+
+  if (needNavigate) {
+    log('Navigating back to view context URL', targetUrl);
+    try {
+      // location.replace um History Pollution zu vermeiden
+      location.replace(targetUrl);
+    } catch {
+      location.assign(targetUrl);
+    }
+  }
+
+  const maxWait = VIEW_RESTORE_TIMEOUT;
+  const gridReady = await waitForGridReady(maxWait);
+  if (!gridReady) {
+    log('Grid not ready within timeout');
+    return;
+  }
+
+  restoreScrollContext(ctx.scrollCtx);
+
+  if (REOPEN_EVENT_PANEL) {
+    const reopened = await reopenOriginalEvent(ctx);
+    if (!reopened) {
+      log('Could not reopen original event (timeout)');
+    }
+  }
+}
+
+/* ================== DYNAMIC BUTTON TEMPLATE ================== */
 function buildDuplicateButtonMarkup(panel, eventId) {
   const tooltipId = `tt-dup-${ Date.now() }-${ Math.random().
                                                     toString(36).
                                                     slice(2, 6) }`;
   const label = t('duplicateEvent');
 
-  // Find a reference action button (exclude our own)
   const refBtn = Array.from(panel.querySelectorAll('button')).
                        find(b => !b.closest(GCQD_DUPLICATE_BUTTON_SELECTOR) &&
                                  b.getAttribute('aria-label') &&
@@ -193,20 +426,16 @@ function buildDuplicateButtonMarkup(panel, eventId) {
 
   if (refBtn) {
     btnClasses = refBtn.className.trim() || btnClasses;
-    // Check if ref has an immediate previous sibling that is the circle spacer
     const prev = refBtn.previousElementSibling;
     if (prev && prev.classList.contains('VbA1ue')) {
       includeCircleSpacer = true;
     } else {
-      // Some panels put circle *inside* previous wrapper; also check panel root variant
       includeCircleSpacer = !!panel.querySelector('.VbA1ue');
     }
   } else {
-    // Heuristik: any circle in panel
     includeCircleSpacer = !!panel.querySelector('.VbA1ue');
   }
 
-  // Build inner spans similar to Google structure (copy minimal consistent structure)
   const circleDiv = includeCircleSpacer ? '<div class="VbA1ue"></div>' : '';
 
   return `
@@ -226,9 +455,9 @@ function buildDuplicateButtonMarkup(panel, eventId) {
         >
           <span class="OiePBf-zPjgPe pYTkkf-Bz112c-UHGRz"></span>
           <span class="RBHQF-ksKsZd" jscontroller="LBaJxb" jsname="m9ZlFb"></span>
-          <span jsname="S5tZuc" aria-hidden="true" class="pYTkkf-Bz112c-kBDsod-Rtc0Jf">
-            <span class="notranslate VfPpkd-kBDsod" aria-hidden="true">${ DUPLICATE_ICON_SVG }</span>
-          </span>
+            <span jsname="S5tZuc" aria-hidden="true" class="pYTkkf-Bz112c-kBDsod-Rtc0Jf">
+              <span class="notranslate VfPpkd-kBDsod" aria-hidden="true">${ DUPLICATE_ICON_SVG }</span>
+            </span>
           <div class="pYTkkf-Bz112c-RLmnJb"></div>
         </button>
         <div class="ne2Ple-oshW8e-V67aGc" role="tooltip" aria-hidden="true" id="${ tooltipId }">
@@ -263,7 +492,6 @@ function scheduleInjection(panel, eventId) {
 function injectDuplicateButton(eventId) {
   const panels = document.querySelectorAll(EVENT_PANEL_SELECTOR);
   if (!panels.length) {
-    // Wait briefly for panel to appear
     const tempObs = new MutationObserver((_m, obs) => {
       const p = document.querySelector(EVENT_PANEL_SELECTOR);
       if (p) {
@@ -279,17 +507,14 @@ function injectDuplicateButton(eventId) {
 }
 
 function panelLooksStable(panel) {
-  // Must have at least one Google action button present
   return panel.querySelector('button[aria-label]') != null;
 }
 
 function injectButtonIntoPanel(panel, eventId) {
   if (!panel || panel.querySelector(GCQD_DUPLICATE_BUTTON_SELECTOR)) {
-    log('Skip (present/!panel)');
     return;
   }
   if (!panelLooksStable(panel)) {
-    log('Panel not stable yet – retry inject');
     scheduleInjection(panel, eventId);
     return;
   }
@@ -316,7 +541,6 @@ function startHealObserver(panel, eventId) {
     }
     if (Date.now() - start > HEAL_OBSERVER_DURATION_MS) {
       observer.disconnect();
-      log('Heal observer stopped');
     }
   });
   observer.observe(panel, { childList: true, subtree: true });
@@ -335,18 +559,36 @@ function startHealObserver(panel, eventId) {
 /* ================== DUPLICATION WORKFLOW ================== */
 function duplicateEvent() {
   if (state.isDuplicating) {
-    log('Dup already running');
     return;
   }
   state.isDuplicating = true;
   document.body.classList.add('gcqd-active');
   state.storeUrl();
 
+  // Versuche ursprüngliche EventID aus geöffnetem Panel abzuleiten
+  let panelEventId = null;
+  const openPanel = document.querySelector(EVENT_PANEL_SELECTOR);
+  if (openPanel) {
+    // Falls unser Button schon drin, ID aus data-id:
+    const dupWrapper = openPanel.querySelector(GCQD_DUPLICATE_BUTTON_SELECTOR);
+    if (dupWrapper && dupWrapper.getAttribute('data-id')) {
+      panelEventId = dupWrapper.getAttribute('data-id');
+    } else {
+      // alternativ: ersten Action-Button mit data-id
+      const btnWithId = openPanel.querySelector('button[data-id]');
+      if (btnWithId) {
+        panelEventId = btnWithId.getAttribute('data-id');
+      }
+    }
+  }
+
+  captureViewContext(panelEventId);
+
   state.resetRetry('duplicate');
   state.setInterval('duplicate', () => {
     if (state.hasExceeded('duplicate')) {
       console.error('Max retries duplicate');
-      cleanup();
+      cleanupFull();
       return;
     }
     const options = document.querySelector(OPTIONS_BUTTON_SELECTOR);
@@ -374,7 +616,7 @@ function saveEvent() {
   state.setInterval('save', () => {
     if (state.hasExceeded('save')) {
       console.error('Max retries save');
-      cleanup();
+      cleanupFull();
       return;
     }
     const saveBtn = document.querySelector(SAVE_BUTTON_SELECTOR);
@@ -389,44 +631,41 @@ function saveEvent() {
       setTimeout(handlePostSaveNavigation, 500);
     } catch (e) {
       console.error('save failed', e);
-      cleanup();
+      cleanupFull();
     }
   }, INTERVAL_DELAY);
 }
 
 async function handlePostSaveNavigation() {
   if (!state.originalUrl || !state.isDuplicating) {
-    cleanup();
+    cleanupFull();
     return;
   }
   try {
+    // Warte kurz bis Google seine Redirects macht
     await new Promise(r => setTimeout(r, 700));
-    if (location.href.includes('duplicate')) {
-      location.assign(state.originalUrl);
-    }
-    await waitForNavigationComplete(state.originalUrl);
+    // Jetzt NICHT mehr stumpf originalUrl forcieren, sondern Kontext wiederherstellen
+    await restoreViewContext();
   } catch (e) {
     console.error('post-save nav', e);
   } finally {
-    cleanup();
+    cleanupRuntime();
   }
 }
 
-function waitForNavigationComplete(target, maxWait = 5000) {
-  return new Promise(res => {
-    const start = Date.now();
-    const id = setInterval(() => {
-      const cur = location.href;
-      if (cur === target ||
-          (!cur.includes('duplicate') && !cur.includes('eventedit'))) {
-        clearInterval(id);
-        res(true);
-      } else if (Date.now() - start > maxWait) {
-        clearInterval(id);
-        res(false);
-      }
-    }, 100);
-  });
+/* ================== CLEANUP ================== */
+function cleanupRuntime() {
+  state.resetRuntime();
+  document.body.classList.remove('gcqd-active');
+  document.querySelectorAll(GCQD_DUPLICATE_BUTTON_SELECTOR).
+           forEach(n => n.remove());
+}
+
+function cleanupFull() {
+  state.fullReset();
+  document.body.classList.remove('gcqd-active');
+  document.querySelectorAll(GCQD_DUPLICATE_BUTTON_SELECTOR).
+           forEach(n => n.remove());
 }
 
 /* ================== APP / EVENTS ================== */
@@ -440,7 +679,7 @@ function setupEventListeners() {
   addEvent(document, 'click', `${ GCQD_DUPLICATE_BUTTON_SELECTOR } button`,
            () => duplicateEvent());
 
-  window.addEventListener('beforeunload', cleanup);
+  window.addEventListener('beforeunload', cleanupFull);
 
   // URL change watcher
   let lastUrl = location.href;
@@ -448,30 +687,25 @@ function setupEventListeners() {
     const url = location.href;
     if (url !== lastUrl) {
       lastUrl = url;
-      if (!url.includes('duplicate') && state.isDuplicating) {
-        cleanup();
+      if (!url.includes('duplicate') && state.isDuplicating &&
+          !/eventedit/.test(url)) {
+        // Wir lassen restoreViewContext übernehmen – kein sofortiges cleanup
       }
     }
   }).observe(document, { childList: true, subtree: true });
 
-  // Fallback body click (if delegated missed)
+  // Fallback body click
   document.body.addEventListener('click', e => {
-    if (extractEventId(e)) {
-      injectDuplicateButton(extractEventId(e));
+    const id = extractEventId(e);
+    if (id) {
+      injectDuplicateButton(id);
     }
   });
 }
 
-function cleanup() {
-  state.reset();
-  document.body.classList.remove('gcqd-active');
-  document.querySelectorAll(GCQD_DUPLICATE_BUTTON_SELECTOR).
-           forEach(n => n.remove());
-}
-
 function app() {
   setupEventListeners();
-  log('Duplicate extension initialized (dynamic style adaptive).');
+  log('Duplicate extension initialized (view context restore).');
 }
 
 /* ================== INIT ================== */
