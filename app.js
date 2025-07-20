@@ -1,90 +1,77 @@
 'use strict';
 
-/** ========== CONSTANTS ========== */
+/**
+ * Dynamic style-adaptive duplicate button.
+ * Adapts to both panel variants (with or without background image / circle spacer).
+ * Includes previous stabilization (debounced injection + heal observer).
+ */
+
+const DEBUG = true;
+
+function log(...args) {
+  if (DEBUG) {
+    console.debug('[GCQD]', ...args);
+  } else {
+    console.info('[GCQD]', ...args);
+  }
+}
+
+/* ================== CONSTANTS ================== */
 const GCQD_DUPLICATE_BUTTON_CLASS = 'dup-btn';
 const GCQD_DUPLICATE_BUTTON_SELECTOR = `.${ GCQD_DUPLICATE_BUTTON_CLASS }`;
-const CIRCLE_BUTTON_CLASS = 'VbA1ue';
-const CALENDAR_EVENT_SELECTOR = 'div[data-eventid][data-eventchip]';
+const CALENDAR_EVENT_SELECTOR = 'div[data-eventid][data-eventchip], div[data-event-id][data-eventchip]';
 const EVENT_PANEL_SELECTOR = '.pPTZAe';
 const OPTIONS_BUTTON_SELECTOR = '.d29e1c';
 const SAVE_BUTTON_SELECTOR = '[jsname="x8hlje"]';
-const DUPLICATE_BUTTON_SELECTOR = '[jsname="lbYRR"]';
-const MINI_CALENDAR_NOT_THIS_MONTH_SELECTOR = '.q2d9Ze';
-const MINI_CALENDAR_DAY_SELECTOR = `.IOneve:not(${ MINI_CALENDAR_NOT_THIS_MONTH_SELECTOR })`;
-const MINI_CALENDAR_CURRENT_DAY_SELECTOR = '.pWJCO';
-const INTERVAL_DELAY = 50;
-const MAX_RETRIES = 100; // Prevent infinite loops
-const DUPLICATE_ICON_SVG = '<svg height="20" viewBox="0 0 24 24" width="20" focusable="false" class="NMm5M"><path d="M0 0h24v24H0V0z" fill="none"/><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm-1 4H8c-1.1 0-1.99.9-1.99 2L6 21c0 1.1.89 2 1.99 2H19c1.1 0 2-.9 2-2V11l-6-6zM8 21V7h6v5h5v9H8z"/></svg>';
+const DUPLICATE_MENU_ITEM_SELECTOR = '[jsname="lbYRR"]';
+const MINI_CAL_SELECTOR = '.pWJCO';
 
-/** ========== INTERNATIONALIZATION ========== */
+const INTERVAL_DELAY = 50;
+const MAX_RETRIES = 100;
+const INJECTION_DEBOUNCE_MS = 120;
+const HEAL_OBSERVER_DURATION_MS = 3000;
+const HEAL_RECHECK_DELAY = 60;
+
+const DUPLICATE_ICON_SVG =
+          '<svg height="20" viewBox="0 0 24 24" width="20" focusable="false" class="NMm5M"><path d="M0 0h24v24H0V0z" fill="none"></path><path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm-1 4H8c-1.1 0-1.99.9-1.99 2L6 21c0 1.1.89 2 1.99 2H19c1.1 0 2-.9 2-2V11l-6-6zM8 21V7h6v5h5v9H8z"></path></svg>';
+
 const TRANSLATIONS = {
-  de: {
-    duplicateEvent: 'Termin duplizieren',
-  },
-  en: {
-    duplicateEvent: 'Duplicate event',
-  },
-  es: {
-    duplicateEvent: 'Duplicar evento',
-  },
-  fr: {
-    duplicateEvent: 'Dupliquer l’événement',
-  },
-  it: {
-    duplicateEvent: 'Duplica evento',
-  },
-  pt: {
-    duplicateEvent: 'Duplicar evento',
-  },
-  nl: {
-    duplicateEvent: 'Evenement dupliceren',
-  },
-  pl: {
-    duplicateEvent: 'Duplikuj wydarzenie',
-  },
-  tr: {
-    duplicateEvent: 'Etkinliği çoğalt',
-  },
-  uk: {
-    duplicateEvent: 'Дублювати подію',
-  },
+  de: { duplicateEvent: 'Termin duplizieren' },
+  en: { duplicateEvent: 'Duplicate event' },
+  es: { duplicateEvent: 'Duplicar evento' },
+  fr: { duplicateEvent: 'Dupliquer l\'événement' },
+  it: { duplicateEvent: 'Duplica evento' },
+  pt: { duplicateEvent: 'Duplicar evento' },
+  nl: { duplicateEvent: 'Evenement dupliceren' },
+  pl: { duplicateEvent: 'Duplikuj wydarzenie' },
+  tr: { duplicateEvent: 'Etkinliği çoğalt' },
+  uk: { duplicateEvent: 'Дублювати подію' },
 };
 
-/**
- * Get user's language preference
- */
-function getUserLanguage() {
-  const lang = navigator.language || 'en';
-  const variants = [lang.toLowerCase(), lang.split('-')[0].toLowerCase()];
-  for (const code of variants) {
-    if (TRANSLATIONS[code]) {
-      return code;
-    }
-  }
-  return 'en';
-}
+const GCQD_LANG = (() => {
+  const lang = (navigator.language || 'en').toLowerCase();
+  const base = lang.split('-')[0];
+  return TRANSLATIONS[lang] ? lang : (TRANSLATIONS[base] ? base : 'en');
+})();
 
-/**
- * Get translated text
- */
 function t(key) {
-  const lang = getUserLanguage();
-  return TRANSLATIONS[lang][key] || TRANSLATIONS.en[key];
+  return (TRANSLATIONS[GCQD_LANG] && TRANSLATIONS[GCQD_LANG][key]) ||
+         TRANSLATIONS.en[key] || key;
 }
 
-/** ======================================== */
-
-/** ========== STATE MANAGEMENT ========== */
+/* ================== STATE ================== */
 class DuplicatorState {
   constructor() {
     this.intervals = new Map();
-    this.currentDate = '';
     this.retryCount = new Map();
+    this.originalUrl = '';
+    this.currentDate = '';
+    this.isDuplicating = false;
   }
 
-  setInterval(name, func, delay) {
+  setInterval(name, fn, d) {
     this.clearInterval(name);
-    this.intervals.set(name, setInterval(func, delay));
+    this.intervals.set(name, setInterval(fn, d));
   }
 
   clearInterval(name) {
@@ -95,219 +82,286 @@ class DuplicatorState {
   }
 
   clearAllIntervals() {
-    for (const interval of this.intervals.values()) {
-      clearInterval(interval);
-    }
+    for (const id of this.intervals.values()) clearInterval(id);
     this.intervals.clear();
   }
 
   incrementRetry(name) {
-    const count = (this.retryCount.get(name) || 0) + 1;
-    this.retryCount.set(name, count);
-    return count;
+    const c = (this.retryCount.get(name) || 0) + 1;
+    this.retryCount.set(name, c);
+    return c;
   }
 
   resetRetry(name) {
     this.retryCount.delete(name);
   }
 
-  hasExceededRetries(name) {
+  hasExceeded(name) {
     return (this.retryCount.get(name) || 0) >= MAX_RETRIES;
+  }
+
+  storeUrl() {
+    this.originalUrl = location.href;
+  }
+
+  reset() {
+    this.clearAllIntervals();
+    this.retryCount.clear();
+    this.originalUrl = '';
+    this.currentDate = '';
+    this.isDuplicating = false;
   }
 }
 
 const state = new DuplicatorState();
-/** ======================================== */
 
-/** ========== TEMPLATES ========== */
-/**
- * Creates the duplicate event button.
- *
- * @param {string} eventId - The event ID
- * @param {boolean} hasCircleBtn - true if the event has a circle button
- * @returns {string} HTML string for the duplicate button
- */
-function getDuplicateButton(eventId, hasCircleBtn) {
-  const tooltipId = `tt-dup-${ Date.now() }`;
-  const tooltipText = t('duplicateEvent');
+/* ================== UTILS ================== */
+function addEvent(parent, evt, selector, handler) {
+  parent.addEventListener(evt, function(e) {
+    const tEl = e.target.closest(selector);
+    if (tEl) {
+      handler.call(tEl, e);
+    }
+  }, false);
+}
+
+function htmlToElement(html) {
+  const tpl = document.createElement('template');
+  tpl.innerHTML = html.trim();
+  return tpl.content.firstChild;
+}
+
+function simulateClick(el) {
+  if (!el) {
+    return;
+  }
+  try {
+    el.dispatchEvent(new MouseEvent('mousedown', {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+    }));
+    el.dispatchEvent(new MouseEvent('mouseup', {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+    }));
+    el.click();
+  } catch (e) {
+    console.error('simulateClick', e);
+  }
+}
+
+function getEventIdFromElement(el) {
+  if (!el) {
+    return null;
+  }
+  return el.getAttribute('data-eventid') || el.getAttribute('data-event-id') ||
+         null;
+}
+
+function extractEventId(e) {
+  const tEl = e.target.closest('[data-eventid],[data-event-id]');
+  return tEl ? getEventIdFromElement(tEl) : null;
+}
+
+function setUpShortcut(e) {
+  if (e.altKey && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
+    e.preventDefault();
+    e.stopPropagation();
+    duplicateEvent();
+  }
+}
+
+/* ================== DYNAMIC BUTTON TEMPLATE ================== */
+
+// PATCH: Build button based on reference button in panel
+function buildDuplicateButtonMarkup(panel, eventId) {
+  const tooltipId = `tt-dup-${ Date.now() }-${ Math.random().
+                                                    toString(36).
+                                                    slice(2, 6) }`;
+  const label = t('duplicateEvent');
+
+  // Find a reference action button (exclude our own)
+  const refBtn = Array.from(panel.querySelectorAll('button')).
+                       find(b => !b.closest(GCQD_DUPLICATE_BUTTON_SELECTOR) &&
+                                 b.getAttribute('aria-label') &&
+                                 b.getAttribute('aria-label') !== label);
+
+  let btnClasses = 'pYTkkf-Bz112c-LgbsSe';
+  let includeCircleSpacer = false;
+
+  if (refBtn) {
+    btnClasses = refBtn.className.trim() || btnClasses;
+    // Check if ref has an immediate previous sibling that is the circle spacer
+    const prev = refBtn.previousElementSibling;
+    if (prev && prev.classList.contains('VbA1ue')) {
+      includeCircleSpacer = true;
+    } else {
+      // Some panels put circle *inside* previous wrapper; also check panel root variant
+      includeCircleSpacer = !!panel.querySelector('.VbA1ue');
+    }
+  } else {
+    // Heuristik: any circle in panel
+    includeCircleSpacer = !!panel.querySelector('.VbA1ue');
+  }
+
+  // Build inner spans similar to Google structure (copy minimal consistent structure)
+  const circleDiv = includeCircleSpacer ? '<div class="VbA1ue"></div>' : '';
 
   return `
-    <div class="${ GCQD_DUPLICATE_BUTTON_CLASS }" data-id="${ eventId }" jsaction="JIbuQc:DyVDA">
-      ${ hasCircleBtn ? `<div class="${ CIRCLE_BUTTON_CLASS }"></div>` : '' }
+    <div class="${ GCQD_DUPLICATE_BUTTON_CLASS }" data-id="${ eventId || '' }" jsaction="JIbuQc:DyVDA">
+      ${ circleDiv }
       <span data-is-tooltip-wrapper="true">
         <button
-          class="pYTkkf-Bz112c-LgbsSe pYTkkf-Bz112c-LgbsSe-OWXEXe-SfQLQb-suEOdc hJb6sc"
+          type="button"
+          class="${ btnClasses }"
           jscontroller="PIVayb"
           jsaction="pointerenter:EX0mI;pointerleave:vpvbp;focus:h06R8;blur:zjh6rb;keydown.27:zjh6rb"
           jsname="DyVDA"
-          data-idom-class="hJb6sc"
           data-use-native-focus-logic="true"
           data-tooltip-enabled="true"
           data-tooltip-id="${ tooltipId }"
-          aria-label="${ tooltipText }"
+          aria-label="${ label }"
         >
           <span class="OiePBf-zPjgPe pYTkkf-Bz112c-UHGRz"></span>
           <span class="RBHQF-ksKsZd" jscontroller="LBaJxb" jsname="m9ZlFb"></span>
           <span jsname="S5tZuc" aria-hidden="true" class="pYTkkf-Bz112c-kBDsod-Rtc0Jf">
-            <span class="notranslate VfPpkd-kBDsod" aria-hidden="true">
-              ${ DUPLICATE_ICON_SVG }
-            </span>
+            <span class="notranslate VfPpkd-kBDsod" aria-hidden="true">${ DUPLICATE_ICON_SVG }</span>
           </span>
           <div class="pYTkkf-Bz112c-RLmnJb"></div>
         </button>
         <div class="ne2Ple-oshW8e-V67aGc" role="tooltip" aria-hidden="true" id="${ tooltipId }">
-          ${ tooltipText }
+          ${ label }
         </div>
       </span>
     </div>
   `;
 }
 
-/** ======================================== */
+/* ================== INJECTION / HEAL ================== */
+const panelInjectionTimers = new WeakMap();
 
-/** ========== MAIN FUNCTION ========== */
-function app() {
-  try {
-    setupEventListeners();
-    console.info('Google Calendar Duplicate Extension initialized');
-  } catch (error) {
-    console.error('Failed to initialize extension:', error);
-  }
-}
-
-/**
- * Sets up all event listeners
- */
-function setupEventListeners() {
-  // Event click handler
-  addEvent(document, 'click', CALENDAR_EVENT_SELECTOR, handleEventClick);
-
-  // Duplicate button click handler - now on the button element itself
-  addEvent(document, 'click', `${ GCQD_DUPLICATE_BUTTON_SELECTOR } button`,
-           handleDuplicateClick);
-
-  // Cleanup on page unload
-  window.addEventListener('beforeunload', cleanup);
-}
-
-/**
- * Handles calendar event clicks
- */
-function handleEventClick(e) {
-  // Pass the event element (this), not the event object
-  injectDuplicateButton(this);
-  setUpShortcut(e);
-}
-
-/**
- * Handles duplicate button clicks
- */
-function handleDuplicateClick() {
-  duplicateEvent();
-}
-
-/**
- * Cleanup function to clear all intervals
- */
-function cleanup() {
-  state.clearAllIntervals();
-  document.body.classList.remove('gcqd-active');
-}
-
-/**
- * Injects the duplicate button in the event panel when the user clicks on the event.
- */
-function injectDuplicateButton(eventElement) {
-  console.debug('Injecting duplicate button');
-  const eventId = eventElement.getAttribute('data-eventid');
-
-  if (!eventId) {
-    console.warn('No event ID found');
+function scheduleInjection(panel, eventId) {
+  if (!panel) {
     return;
   }
-
-  state.resetRetry('inject');
-  state.setInterval('inject', function() {
-    if (state.hasExceededRetries('inject')) {
-      console.warn('Max retries exceeded for button injection');
-      state.clearInterval('inject');
-      return;
+  if (panelInjectionTimers.has(panel)) {
+    clearTimeout(panelInjectionTimers.get(panel));
+  }
+  const tid = setTimeout(() => {
+    try {
+      injectButtonIntoPanel(panel, eventId);
+      startHealObserver(panel, eventId);
+    } catch (e) {
+      console.error('inject error', e);
     }
-
-    const eventPanelNode = document.querySelector(EVENT_PANEL_SELECTOR);
-    if (!eventPanelNode) {
-      state.incrementRetry('inject');
-      return;
-    }
-
-    state.clearInterval('inject');
-    const duplicateButton = eventPanelNode.querySelector(
-        GCQD_DUPLICATE_BUTTON_SELECTOR);
-
-    // Inject the button if it's not already there
-    if (!duplicateButton) {
-      prependDuplicateButton(eventPanelNode, eventId);
-    }
-    console.debug('Duplicate button injected successfully');
-  }, INTERVAL_DELAY);
+  }, INJECTION_DEBOUNCE_MS);
+  panelInjectionTimers.set(panel, tid);
 }
 
-/**
- * Prepends the duplicate button to the event panel buttons list.
- */
-function prependDuplicateButton(eventPanelNode, eventId) {
-  const hasCircleBtn = hasCircleButton(eventPanelNode);
-  const duplicateButton = getDuplicateButton(eventId, hasCircleBtn);
-  const element = htmlToElement(duplicateButton);
+function injectDuplicateButton(eventId) {
+  const panels = document.querySelectorAll(EVENT_PANEL_SELECTOR);
+  if (!panels.length) {
+    // Wait briefly for panel to appear
+    const tempObs = new MutationObserver((_m, obs) => {
+      const p = document.querySelector(EVENT_PANEL_SELECTOR);
+      if (p) {
+        obs.disconnect();
+        scheduleInjection(p, eventId);
+      }
+    });
+    tempObs.observe(document.body, { childList: true, subtree: true });
+    setTimeout(() => tempObs.disconnect(), 2000);
+    return;
+  }
+  panels.forEach(p => scheduleInjection(p, eventId));
+}
 
-  if (element) {
-    eventPanelNode.prepend(element);
+function panelLooksStable(panel) {
+  // Must have at least one Google action button present
+  return panel.querySelector('button[aria-label]') != null;
+}
+
+function injectButtonIntoPanel(panel, eventId) {
+  if (!panel || panel.querySelector(GCQD_DUPLICATE_BUTTON_SELECTOR)) {
+    log('Skip (present/!panel)');
+    return;
+  }
+  if (!panelLooksStable(panel)) {
+    log('Panel not stable yet – retry inject');
+    scheduleInjection(panel, eventId);
+    return;
+  }
+  const markup = buildDuplicateButtonMarkup(panel, eventId);
+  const el = htmlToElement(markup);
+  if (el) {
+    panel.prepend(el);
+    log('Injected duplicate button', { eventId });
   }
 }
 
-/**
- * Returns true if the event panel has circle buttons.
- */
-function hasCircleButton(eventPanelNode) {
-  return eventPanelNode.querySelector(`.${ CIRCLE_BUTTON_CLASS }`) !== null;
+function startHealObserver(panel, eventId) {
+  if (!panel) {
+    return;
+  }
+  const start = Date.now();
+  const observer = new MutationObserver(() => {
+    if (!panel.isConnected) {
+      observer.disconnect();
+      return;
+    }
+    if (!panel.querySelector(GCQD_DUPLICATE_BUTTON_SELECTOR)) {
+      injectButtonIntoPanel(panel, eventId);
+    }
+    if (Date.now() - start > HEAL_OBSERVER_DURATION_MS) {
+      observer.disconnect();
+      log('Heal observer stopped');
+    }
+  });
+  observer.observe(panel, { childList: true, subtree: true });
+
+  const healInterval = setInterval(() => {
+    if (!panel.isConnected || Date.now() - start > HEAL_OBSERVER_DURATION_MS) {
+      clearInterval(healInterval);
+      return;
+    }
+    if (!panel.querySelector(GCQD_DUPLICATE_BUTTON_SELECTOR)) {
+      injectButtonIntoPanel(panel, eventId);
+    }
+  }, HEAL_RECHECK_DELAY);
 }
 
-/**
- * Duplicates the event
- */
+/* ================== DUPLICATION WORKFLOW ================== */
 function duplicateEvent() {
-  console.debug('Duplicating event');
+  if (state.isDuplicating) {
+    log('Dup already running');
+    return;
+  }
+  state.isDuplicating = true;
   document.body.classList.add('gcqd-active');
+  state.storeUrl();
 
   state.resetRetry('duplicate');
-  state.setInterval('duplicate', function() {
-    if (state.hasExceededRetries('duplicate')) {
-      console.error('Max retries exceeded for event duplication');
+  state.setInterval('duplicate', () => {
+    if (state.hasExceeded('duplicate')) {
+      console.error('Max retries duplicate');
       cleanup();
       return;
     }
+    const options = document.querySelector(OPTIONS_BUTTON_SELECTOR);
+    const duplicateItem = document.querySelector(DUPLICATE_MENU_ITEM_SELECTOR);
 
-    const optionsButton = document.querySelector(OPTIONS_BUTTON_SELECTOR);
-    const duplicateButton = document.querySelector(DUPLICATE_BUTTON_SELECTOR);
-
-    // Open the options menu if it's closed, then click the duplicate button.
-    if (isOptionsMenuClosed(optionsButton, duplicateButton)) {
-      console.debug('Opening options menu');
-      simulateClick(optionsButton);
+    if (options && !duplicateItem) {
+      simulateClick(options);
       state.incrementRetry('duplicate');
-    } else if (duplicateButton) {
-      console.debug('Options menu opened');
-
-      // Store current date before duplication
-      const currentDayElement = document.querySelector(
-          MINI_CALENDAR_CURRENT_DAY_SELECTOR);
-      if (currentDayElement) {
-        state.currentDate = currentDayElement.getAttribute('data-date');
-        console.debug(`Current date: ${ state.currentDate }`);
+    } else if (duplicateItem) {
+      const curDayEl = document.querySelector(MINI_CAL_SELECTOR);
+      if (curDayEl) {
+        state.currentDate = curDayEl.getAttribute('data-date') ||
+                            '';
       }
-
-      console.debug('Clicking duplicate button');
-      simulateClick(duplicateButton);
+      simulateClick(duplicateItem);
       saveEvent();
     } else {
       state.incrementRetry('duplicate');
@@ -315,185 +369,114 @@ function duplicateEvent() {
   }, INTERVAL_DELAY);
 }
 
-/**
- * Returns true if the options menu inside an event panel is closed.
- */
-function isOptionsMenuClosed(optionsButton, duplicateButton) {
-  return optionsButton !== null && duplicateButton === null;
-}
-
-/**
- * Saves the duplicated event when the save modal has opened.
- */
 function saveEvent() {
-  console.debug('Saving event');
-
   state.resetRetry('save');
-  state.setInterval('save', function() {
-    if (state.hasExceededRetries('save')) {
-      console.error('Max retries exceeded for saving event');
+  state.setInterval('save', () => {
+    if (state.hasExceeded('save')) {
+      console.error('Max retries save');
       cleanup();
       return;
     }
-
-    const saveButton = document.querySelector(SAVE_BUTTON_SELECTOR);
-    if (!saveButton) {
+    const saveBtn = document.querySelector(SAVE_BUTTON_SELECTOR);
+    if (!saveBtn) {
       state.incrementRetry('save');
       return;
     }
-
     state.clearInterval('duplicate');
     state.clearInterval('save');
-
     try {
-      saveButton.click();
-      console.debug('Event saved');
-      goToCurrentDate();
-    } catch (error) {
-      console.error('Failed to save event:', error);
+      simulateClick(saveBtn);
+      setTimeout(handlePostSaveNavigation, 500);
+    } catch (e) {
+      console.error('save failed', e);
       cleanup();
     }
   }, INTERVAL_DELAY);
 }
 
-/**
- * Returns to the date the user was on prior to duplicating the event.
- */
-function goToCurrentDate() {
-  if (!state.currentDate) {
-    console.debug('No stored date to return to');
+async function handlePostSaveNavigation() {
+  if (!state.originalUrl || !state.isDuplicating) {
     cleanup();
     return;
   }
-
-  console.debug(`Going to current date (${ state.currentDate })`);
-
-  state.resetRetry('goToDate');
-  state.setInterval('goToDate', function() {
-    if (state.hasExceededRetries('goToDate')) {
-      console.warn('Max retries exceeded for date navigation');
-      cleanup();
-      return;
-    }
-
+  try {
+    await new Promise(r => setTimeout(r, 700));
     if (location.href.includes('duplicate')) {
-      state.incrementRetry('goToDate');
-      return;
+      location.assign(state.originalUrl);
     }
+    await waitForNavigationComplete(state.originalUrl);
+  } catch (e) {
+    console.error('post-save nav', e);
+  } finally {
+    cleanup();
+  }
+}
 
-    state.clearInterval('goToDate');
+function waitForNavigationComplete(target, maxWait = 5000) {
+  return new Promise(res => {
+    const start = Date.now();
+    const id = setInterval(() => {
+      const cur = location.href;
+      if (cur === target ||
+          (!cur.includes('duplicate') && !cur.includes('eventedit'))) {
+        clearInterval(id);
+        res(true);
+      } else if (Date.now() - start > maxWait) {
+        clearInterval(id);
+        res(false);
+      }
+    }, 100);
+  });
+}
 
-    const todayDate = padDate(new Date());
-    if (state.currentDate !== todayDate) {
-      console.debug(
-          `Current date (${ state.currentDate }) is not today's date (${ todayDate }): navigating to stored date.`);
+/* ================== APP / EVENTS ================== */
+function setupEventListeners() {
+  addEvent(document, 'click', CALENDAR_EVENT_SELECTOR, function(e) {
+    const eventId = getEventIdFromElement(this);
+    injectDuplicateButton(eventId);
+    setUpShortcut(e);
+  });
 
-      try {
-        navigateToDate(state.currentDate);
-      } catch (error) {
-        console.error('Failed to navigate to date:', error);
+  addEvent(document, 'click', `${ GCQD_DUPLICATE_BUTTON_SELECTOR } button`,
+           () => duplicateEvent());
+
+  window.addEventListener('beforeunload', cleanup);
+
+  // URL change watcher
+  let lastUrl = location.href;
+  new MutationObserver(() => {
+    const url = location.href;
+    if (url !== lastUrl) {
+      lastUrl = url;
+      if (!url.includes('duplicate') && state.isDuplicating) {
+        cleanup();
       }
     }
+  }).observe(document, { childList: true, subtree: true });
 
-    console.debug('Navigation complete');
-    cleanup();
-  }, INTERVAL_DELAY);
-}
-
-/**
- * Navigates to a specific date using the mini calendar
- */
-function navigateToDate(targetDate) {
-  const miniDay = document.querySelector(MINI_CALENDAR_DAY_SELECTOR);
-  if (!miniDay) {
-    console.warn('Could not find mini calendar day element');
-    return;
-  }
-
-  const miniWeek = miniDay.parentNode;
-  const clonedDay = miniDay.cloneNode(true);
-  clonedDay.setAttribute('data-date', targetDate);
-  miniWeek.appendChild(clonedDay);
-  clonedDay.click();
-  clonedDay.remove();
-  console.debug('Navigated to target date');
-}
-
-/**
- * Triggers event duplication on shortcut click.
- */
-function setUpShortcut(event) {
-  if (event.altKey && !event.shiftKey && !event.ctrlKey) {
-    event.preventDefault();
-    event.stopPropagation();
-    duplicateEvent();
-  }
-}
-
-/** ======================================== */
-
-/** ========== UTILITY FUNCTIONS ========== */
-/**
- * Pads a date with leading zeros.
- */
-function padDate(date) {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, '0');
-  const day = String(date.getDate()).padStart(2, '0');
-  return `${ year }${ month }${ day }`;
-}
-
-/**
- * Adds event delegation
- */
-function addEvent(parent, evt, selector, handler) {
-  parent.addEventListener(evt, function(event) {
-    const target = event.target.closest(selector);
-    if (target) {
-      handler.call(target, event);
+  // Fallback body click (if delegated missed)
+  document.body.addEventListener('click', e => {
+    if (extractEventId(e)) {
+      injectDuplicateButton(extractEventId(e));
     }
-  }, false);
+  });
 }
 
-/**
- * Returns the element node corresponding to the html in input.
- */
-function htmlToElement(html) {
-  const template = document.createElement('template');
-  template.innerHTML = html.trim();
-  return template.content.firstChild;
+function cleanup() {
+  state.reset();
+  document.body.classList.remove('gcqd-active');
+  document.querySelectorAll(GCQD_DUPLICATE_BUTTON_SELECTOR).
+           forEach(n => n.remove());
 }
 
-/**
- * Simulates a click by the user.
- */
-function simulateClick(element) {
-  if (!element) {
-    console.warn('Cannot click null element');
-    return;
-  }
-
-  try {
-    // Click the element
-    element.click();
-
-    // Dispatch mouse events for better compatibility
-    ['mousedown', 'mouseup'].forEach(eventType => {
-      element.dispatchEvent(new MouseEvent(eventType, {
-        bubbles: true, cancelable: true, view: window,
-      }));
-    });
-  } catch (error) {
-    console.error('Failed to simulate click:', error);
-  }
+function app() {
+  setupEventListeners();
+  log('Duplicate extension initialized (dynamic style adaptive).');
 }
 
-/** ======================================== */
-
-/** ========== INITIALIZATION ========== */
+/* ================== INIT ================== */
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', app);
 } else {
   app();
 }
-/** ======================================== */
